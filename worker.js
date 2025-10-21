@@ -41,6 +41,8 @@ let cache = {
   ts: 0,
 };
 
+const KV_COOKIE_KEY = "you_cookie";
+
 export default {
   async fetch(request, env, ctx) {
     try {
@@ -62,6 +64,7 @@ export default {
               "GET /v1/models",
               "POST /v1/chat/completions",
               "POST /v1/completions",
+              "GET/POST/DELETE /admin/cookie",
             ],
             docs: "https://github.com/",
           }),
@@ -70,6 +73,52 @@ export default {
       }
       if (url.pathname === "/health") {
         return withCors(json({ status: "ok" }), request);
+      }
+
+      // Admin routes (KV cookie management)
+      if (url.pathname.startsWith("/admin")) {
+        const authorized = checkAuth(request, env);
+        if (!authorized.ok) {
+          return withCors(
+            json({ error: "unauthorized", message: authorized.message }, 401),
+            request
+          );
+        }
+
+        if (url.pathname === "/admin/cookie") {
+          if (request.method === "GET") {
+            if (!env?.YOU_COOKIE_KV || typeof env.YOU_COOKIE_KV.get !== "function") {
+              return withCors(json({ error: "kv_not_configured", message: "Bind a KV namespace as YOU_COOKIE_KV" }, 400), request);
+            }
+            const c = await env.YOU_COOKIE_KV.get("you_cookie");
+            return withCors(json({ exists: !!c, length: c ? c.length : 0 }), request);
+          }
+          if (request.method === "POST") {
+            if (!env?.YOU_COOKIE_KV || typeof env.YOU_COOKIE_KV.put !== "function") {
+              return withCors(json({ error: "kv_not_configured", message: "Bind a KV namespace as YOU_COOKIE_KV" }, 400), request);
+            }
+            const body = (await safeParseJson(request)) || {};
+            let cookie = body.cookie || "";
+            if (!cookie && body.cookie_b64) {
+              try { cookie = atob(String(body.cookie_b64)); } catch (_) {}
+            }
+            if (!cookie || typeof cookie !== "string" || cookie.length < 10) {
+              return withCors(json({ error: "invalid_cookie", message: "Provide 'cookie' or 'cookie_b64'" }, 400), request);
+            }
+            await env.YOU_COOKIE_KV.put("you_cookie", cookie);
+            return withCors(json({ ok: true }), request);
+          }
+          if (request.method === "DELETE") {
+            if (!env?.YOU_COOKIE_KV || typeof env.YOU_COOKIE_KV.delete !== "function") {
+              return withCors(json({ error: "kv_not_configured", message: "Bind a KV namespace as YOU_COOKIE_KV" }, 400), request);
+            }
+            await env.YOU_COOKIE_KV.delete("you_cookie");
+            return withCors(json({ ok: true }), request);
+          }
+          return withCors(json({ error: "method_not_allowed" }, 405), request);
+        }
+
+        return withCors(json({ error: "not_found" }, 404), request);
       }
 
       // Auth check for API endpoints under /v1
@@ -85,7 +134,7 @@ export default {
 
       // OpenAI-compatible: list models
       if (url.pathname === "/v1/models" && request.method === "GET") {
-        const models = await getModels(env);
+        const models = await getModels(env, request);
         const data = models.map((id) => ({ id, object: "model", owned_by: "you.com" }));
         return withCors(json({ object: "list", data }), request);
       }
@@ -107,6 +156,8 @@ export default {
           temperature: body.temperature,
           top_p: body.top_p,
           max_tokens: body.max_tokens,
+          ...(body.you_cookie ? { you_cookie: body.you_cookie } : {}),
+          ...(body.you_cookie_b64 ? { you_cookie_b64: body.you_cookie_b64 } : {}),
         };
         return await handleChatCompletions(chatBody, request, env);
       }
@@ -154,7 +205,7 @@ async function handleChatCompletions(body, request, env) {
     return withCors(json({ error: "invalid_request", message: "Empty prompt derived from messages" }, 400), request);
   }
 
-  const cookie = await getYouCookie(env);
+  const cookie = await getYouCookie(env, request, body);
 
   if (stream) {
     const id = makeId();
@@ -270,7 +321,7 @@ function toText(content) {
   return String(content);
 }
 
-async function getModels(env) {
+async function getModels(env, request) {
   const ttl = Number(env?.CACHE_TTL_SECONDS || 900) * 1000;
   const now = Date.now();
   if (cache.models && now - cache.ts < ttl) {
@@ -280,7 +331,7 @@ async function getModels(env) {
   // Prefer dynamic fetch when enabled
   if (String(env?.DYNAMIC_FETCH).toLowerCase() === "true") {
     try {
-      const dynamic = await tryFetchModelsFromYou(env);
+      const dynamic = await tryFetchModelsFromYou(env, request);
       if (dynamic && dynamic.length) {
         cache.models = dynamic;
         cache.ts = now;
@@ -310,21 +361,21 @@ async function getModels(env) {
   return DEFAULT_MODELS;
 }
 
-async function tryFetchModelsFromYou(env) {
+async function tryFetchModelsFromYou(env, request) {
   const username = env?.YOU_USERNAME || env?.YOU_EMAIL;
   const password = env?.YOU_PASSWORD;
-  const cookieFromEnv = (env?.YOU_COOKIE || "").trim();
+  const cookieCandidate = (await pickCookie(env, request, null)) || "";
 
-  // If user provides cookie, attempt model endpoints with it
+  // If user provides cookie (via header/KV/env), attempt model endpoints with it
   const publicCandidates = [
     "https://you.com/api/models",
     "https://you.com/api/llm/models",
     "https://you.com/api/llm/providers",
   ];
-  if (cookieFromEnv) {
+  if (cookieCandidate) {
     for (const url of publicCandidates) {
       try {
-        const r = await fetch(url, { headers: { ...defaultHeaders(), cookie: cookieFromEnv } });
+        const r = await fetch(url, { headers: { ...defaultHeaders(), cookie: cookieCandidate } });
         if (r.ok) {
           const data = await safeJson(r);
           const models = normalizeModelsFromUnknown(data);
@@ -333,8 +384,6 @@ async function tryFetchModelsFromYou(env) {
       } catch (_) {}
     }
   }
-
-  if (!username || !password) return null;
 
   // Try unauthenticated endpoints first
   for (const url of publicCandidates) {
@@ -347,6 +396,9 @@ async function tryFetchModelsFromYou(env) {
       }
     } catch (_) {}
   }
+
+  // If no username/password configured, stop here
+  if (!username || !password) return null;
 
   // Attempt credential login (experimental; may fail due to anti-bot/CSRF)
   // 1) Get initial cookies/CSRF if available
@@ -392,9 +444,9 @@ async function tryFetchModelsFromYou(env) {
   return null;
 }
 
-async function getYouCookie(env) {
-  const fromEnv = (env?.YOU_COOKIE || "").trim();
-  if (fromEnv) return fromEnv;
+async function getYouCookie(env, request, body) {
+  const picked = await pickCookie(env, request, body);
+  if (picked) return picked;
 
   const username = env?.YOU_USERNAME || env?.YOU_EMAIL;
   const password = env?.YOU_PASSWORD;
@@ -411,12 +463,12 @@ async function getYouCookie(env) {
     "https://you.com/api/login",
   ];
   for (const endpoint of loginEndpoints) {
-    for (const body of loginBodies) {
+    for (const b of loginBodies) {
       try {
         const r = await fetch(endpoint, {
           method: "POST",
           headers: { ...defaultHeaders(), "content-type": "application/json", ...(cookie ? { cookie } : {}) },
-          body: JSON.stringify(body),
+          body: JSON.stringify(b),
         });
         const setCookie = r.headers.get("set-cookie");
         if (setCookie) cookie = mergeCookies(cookie, setCookie);
@@ -425,6 +477,45 @@ async function getYouCookie(env) {
     }
   }
   return cookie || "";
+}
+
+async function pickCookie(env, request, body) {
+  // 1) From request body
+  if (body) {
+    if (typeof body.you_cookie === "string" && body.you_cookie.trim().length > 10) {
+      return body.you_cookie.trim();
+    }
+    if (typeof body.you_cookie_b64 === "string") {
+      try {
+        const decoded = atob(body.you_cookie_b64);
+        if (decoded && decoded.trim().length > 10) return decoded.trim();
+      } catch (_) {}
+    }
+  }
+  // 2) From request headers
+  if (request && request.headers) {
+    const h = request.headers;
+    const direct = h.get("x-you-cookie");
+    if (direct && direct.trim().length > 10) return direct.trim();
+    const b64 = h.get("x-you-cookie-b64") || h.get("x-you-cookie-base64");
+    if (b64) {
+      try {
+        const decoded = atob(b64.trim());
+        if (decoded && decoded.trim().length > 10) return decoded.trim();
+      } catch (_) {}
+    }
+  }
+  // 3) From KV
+  if (env?.YOU_COOKIE_KV && typeof env.YOU_COOKIE_KV.get === "function") {
+    try {
+      const c = await env.YOU_COOKIE_KV.get(KV_COOKIE_KEY);
+      if (c && c.trim().length > 10) return c.trim();
+    } catch (_) {}
+  }
+  // 4) From env
+  const fromEnv = (env?.YOU_COOKIE || "").trim();
+  if (fromEnv && fromEnv.length > 10) return fromEnv;
+  return "";
 }
 
 function normalizeModelsFromUnknown(data) {
@@ -647,9 +738,9 @@ function withCors(response, request) {
   headers.set("access-control-allow-credentials", "true");
   headers.set(
     "access-control-allow-headers",
-    "authorization, content-type, x-api-key, x-requested-with"
+    "authorization, content-type, x-api-key, x-requested-with, x-you-cookie, x-you-cookie-b64, x-you-cookie-base64"
   );
-  headers.set("access-control-allow-methods", "GET, POST, OPTIONS");
+  headers.set("access-control-allow-methods", "GET, POST, DELETE, OPTIONS");
   return new Response(response.body, { status: response.status, headers });
 }
 

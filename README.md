@@ -37,13 +37,23 @@
   - 用浏览器登录 you.com；
   - 打开浏览器开发者工具（F12）-> Application/存储 -> Cookies -> 选中 https://you.com；
   - 将相关 Cookie 项拼接为一个 `Cookie` 请求头值（或在 Network 面板选中 you.com 的接口请求，右键 Copy -> Copy request headers，从中复制完整的 `Cookie: ...`）；
-  - 将上述整段粘贴到 Worker 环境变量 `YOU_COOKIE` 中；
-  - 注：Cookie 有有效期，请勿泄露，过期后需重新复制。
+  - 注：Cloudflare Worker 的文本变量有大小限制（约 5 KB）。若你的 `YOU_COOKIE` 超过限制，会报错 “Text binding 'YOU_COOKIE' is too large ...”。此时请选择以下任一方案：
+    1) 在请求中携带 Cookie（无需存入环境变量）：
+       - 通过请求头传入：`X-You-Cookie: <完整 Cookie>`，或 `X-You-Cookie-B64: <Base64 编码后的 Cookie>`；
+       - 在请求体里传入（仅对 POST 生效）：`{"you_cookie": "..."}` 或 `{"you_cookie_b64": "..."}`；
+    2) 使用 Cloudflare KV 持久化 Cookie：
+       - 在 Dashboard -> Workers -> KV 中创建命名空间，并将其绑定到 Worker，变量名设为 `YOU_COOKIE_KV`；
+       - 然后调用本 Worker 的管理接口设置 Cookie：
+         - `POST /admin/cookie`，JSON: `{ "cookie": "<完整 Cookie>" }` 或 `{ "cookie_b64": "<Base64>" }`；
+         - `GET /admin/cookie` 查看是否已设置（仅返回存在与长度，不回显具体内容）；
+         - `DELETE /admin/cookie` 清除；
+       - 以上管理接口都需要携带 `MANUAL_API_KEY` 鉴权。
+  - Cookie 有有效期，请勿泄露，过期后需重新复制。
 
 - YOU_USERNAME / YOU_PASSWORD（降级方案）：
   - 分别填写你在 you.com 的登录邮箱/用户名与密码；
   - Worker 会尝试“最佳努力”进行登录以获取 Cookie，可能受风控/CSRF 等影响而失败；
-  - 若失败，建议改为提供 `YOU_COOKIE`。
+  - 若失败，优先改为提供 `YOU_COOKIE`（通过请求头/请求体或 KV 持久化）。
 
 ## API 使用
 
@@ -55,6 +65,10 @@
   - `X-API-Key: <MANUAL_API_KEY>`
   - 在查询参数中追加 `?key=<MANUAL_API_KEY>`
 
+- 可选地随请求附带 you.com Cookie（若未使用 KV 或环境变量）：
+  - 通过请求头：`X-You-Cookie: <完整 Cookie>` 或 `X-You-Cookie-B64: <Base64>`；
+  - 通过请求体（仅 POST）：`{"you_cookie": "..."}` 或 `{"you_cookie_b64": "..."}`。
+
 - 获取模型列表（OpenAI 兼容）：
   - `GET /v1/models`
 
@@ -65,6 +79,7 @@
 curl -s https://<你的-worker-子域>.workers.dev/v1/chat/completions \
   -H "Authorization: Bearer <MANUAL_API_KEY>" \
   -H "Content-Type: application/json" \
+  -H "X-You-Cookie-B64: $(printf '%s' "<你的Cookie>" | base64 -w0)" \
   -d '{
     "model": "you-chat",
     "messages": [
@@ -79,6 +94,7 @@ curl -s https://<你的-worker-子域>.workers.dev/v1/chat/completions \
 curl -N https://<你的-worker-子域>.workers.dev/v1/chat/completions \
   -H "Authorization: Bearer <MANUAL_API_KEY>" \
   -H "Content-Type: application/json" \
+  -H "X-You-Cookie-B64: $(printf '%s' "<你的Cookie>" | base64 -w0)" \
   -d '{
     "model": "you-chat",
     "messages": [
@@ -95,12 +111,26 @@ curl -N https://<你的-worker-子域>.workers.dev/v1/chat/completions \
 curl -s https://<你的-worker-子域>.workers.dev/v1/completions \
   -H "Authorization: Bearer <MANUAL_API_KEY>" \
   -H "Content-Type: application/json" \
+  -H "X-You-Cookie-B64: $(printf '%s' "<你的Cookie>" | base64 -w0)" \
   -d '{
     "model": "you-chat",
     "prompt": "Write a haiku about the ocean.",
     "stream": false
   }'
 ```
+
+### 管理接口（用于在 KV 中设置 Cookie）
+
+- 说明：需先在 Cloudflare 控制台为 Worker 绑定一个 KV 命名空间，变量名为 `YOU_COOKIE_KV`。
+- 统一鉴权：所有 /admin 路由都需要 `MANUAL_API_KEY`。
+- 接口：
+  - `POST /admin/cookie` 设置 Cookie
+    - 请求体（JSON）：`{"cookie":"<完整Cookie>"}` 或 `{"cookie_b64":"<Base64>"}`
+    - 响应：`{"ok":true}`
+  - `GET /admin/cookie` 查看是否已设置
+    - 响应：`{"exists":true, "length": 6900}`（不会返回具体 Cookie）
+  - `DELETE /admin/cookie` 清除 Cookie
+    - 响应：`{"ok":true}`
 
 ## Cherry Studio 客户端配置
 
@@ -109,9 +139,10 @@ curl -s https://<你的-worker-子域>.workers.dev/v1/completions \
    - 推荐填写：`https://<你的-worker-子域>.workers.dev`
    - 若客户端需要显式 `/v1` 前缀，请改为：`https://<你的-worker-子域>.workers.dev/v1`
 3. API Key：填写你在 Worker 中配置的 `MANUAL_API_KEY`
-4. 保存后，点击刷新/获取模型列表；如果配置了 `YOU_COOKIE` 或可登录 you.com，应该可以使用 `you-chat` 或你在 `STATIC_MODELS` 中自定义的模型名。
+4. 如果客户端支持自定义请求头，建议添加：`X-You-Cookie-B64: <Base64后的you.com Cookie>`，以避免环境变量长度限制；
+5. 保存后，点击刷新/获取模型列表；如果配置了 `YOU_COOKIE`、在 KV 中设置了 Cookie，或你能成功登录 you.com，应该可以使用 `you-chat` 或你在 `STATIC_MODELS` 中自定义的模型名。
 
-提示：若无法获取到 you.com 的动态模型或对话失败（例如因为登录需要额外验证），建议直接设置 `YOU_COOKIE`；若仍有问题，可在 `STATIC_MODELS` 中手动维护你期望显示的模型列表，并使用 `you-chat` 作为通用模型名。
+提示：若无法获取到 you.com 的动态模型或对话失败（例如因为登录需要额外验证），建议直接设置 `YOU_COOKIE`（通过 KV 或请求头）；若仍有问题，可在 `STATIC_MODELS` 中手动维护你期望显示的模型列表，并使用 `you-chat` 作为通用模型名。
 
 ## 工作原理
 
