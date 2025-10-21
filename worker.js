@@ -42,6 +42,20 @@ let cache = {
 };
 
 const KV_COOKIE_KEY = "you_cookie";
+const KV_EXTRA_MODELS_KEY = "extra_models";
+
+const PRO_BONUS_MODELS = [
+  "gpt-4o",
+  "gpt-4o-mini",
+  "gpt-4.1",
+  "gpt-4.1-mini",
+  "claude-3-5-sonnet",
+  "claude-3-5-haiku",
+  "llama-3.1-405b-instruct",
+  "llama-3.1-70b-instruct",
+  "mistral-large-latest",
+  "qwen-2-72b-instruct",
+];
 
 export default {
   async fetch(request, env, ctx) {
@@ -65,6 +79,7 @@ export default {
               "POST /v1/chat/completions",
               "POST /v1/completions",
               "GET/POST/DELETE /admin/cookie",
+              "GET/POST/DELETE /admin/models",
             ],
             docs: "https://github.com/",
           }),
@@ -90,7 +105,7 @@ export default {
             if (!env?.YOU_COOKIE_KV || typeof env.YOU_COOKIE_KV.get !== "function") {
               return withCors(json({ error: "kv_not_configured", message: "Bind a KV namespace as YOU_COOKIE_KV" }, 400), request);
             }
-            const c = await env.YOU_COOKIE_KV.get("you_cookie");
+            const c = await env.YOU_COOKIE_KV.get(KV_COOKIE_KEY);
             return withCors(json({ exists: !!c, length: c ? c.length : 0 }), request);
           }
           if (request.method === "POST") {
@@ -105,14 +120,44 @@ export default {
             if (!cookie || typeof cookie !== "string" || cookie.length < 10) {
               return withCors(json({ error: "invalid_cookie", message: "Provide 'cookie' or 'cookie_b64'" }, 400), request);
             }
-            await env.YOU_COOKIE_KV.put("you_cookie", cookie);
+            await env.YOU_COOKIE_KV.put(KV_COOKIE_KEY, cookie);
             return withCors(json({ ok: true }), request);
           }
           if (request.method === "DELETE") {
             if (!env?.YOU_COOKIE_KV || typeof env.YOU_COOKIE_KV.delete !== "function") {
               return withCors(json({ error: "kv_not_configured", message: "Bind a KV namespace as YOU_COOKIE_KV" }, 400), request);
             }
-            await env.YOU_COOKIE_KV.delete("you_cookie");
+            await env.YOU_COOKIE_KV.delete(KV_COOKIE_KEY);
+            return withCors(json({ ok: true }), request);
+          }
+          return withCors(json({ error: "method_not_allowed" }, 405), request);
+        }
+
+        if (url.pathname === "/admin/models") {
+          if (!env?.YOU_COOKIE_KV) {
+            return withCors(json({ error: "kv_not_configured", message: "Bind a KV namespace as YOU_COOKIE_KV" }, 400), request);
+          }
+          if (request.method === "GET") {
+            const raw = await env.YOU_COOKIE_KV.get(KV_EXTRA_MODELS_KEY);
+            let list = [];
+            try { list = JSON.parse(raw || "[]"); } catch (_) {}
+            return withCors(json({ data: Array.isArray(list) ? list : [] }), request);
+          }
+          if (request.method === "POST") {
+            const body = (await safeParseJson(request)) || {};
+            let list = body.models;
+            if (typeof list === "string") {
+              try { list = JSON.parse(list); } catch (_) {}
+            }
+            if (!Array.isArray(list)) {
+              return withCors(json({ error: "invalid_models", message: "Provide JSON array in 'models'" }, 400), request);
+            }
+            const cleaned = list.filter((x) => typeof x === "string" && x.trim());
+            await env.YOU_COOKIE_KV.put(KV_EXTRA_MODELS_KEY, JSON.stringify(cleaned));
+            return withCors(json({ ok: true, count: cleaned.length }), request);
+          }
+          if (request.method === "DELETE") {
+            await env.YOU_COOKIE_KV.delete(KV_EXTRA_MODELS_KEY);
             return withCors(json({ ok: true }), request);
           }
           return withCors(json({ error: "method_not_allowed" }, 405), request);
@@ -217,7 +262,22 @@ async function handleChatCompletions(body, request, env) {
     const task = (async () => {
       let sentRole = false;
       let contentBuf = "";
+
+      // Emit an initial role-only chunk to maximize client compatibility
+      const roleInitChunk = {
+        id,
+        object: "chat.completion.chunk",
+        created,
+        model,
+        choices: [
+          { index: 0, delta: { role: "assistant" }, finish_reason: null },
+        ],
+      };
+      controller.enqueue(encodeSSE({ data: JSON.stringify(roleInitChunk) }));
+      sentRole = true;
+
       const tokenSender = async (token) => {
+        if (!token) return;
         contentBuf += token;
         const chunk = {
           id,
@@ -227,16 +287,27 @@ async function handleChatCompletions(body, request, env) {
           choices: [
             {
               index: 0,
-              delta: { ...(sentRole ? {} : { role: "assistant" }), content: token },
+              delta: { content: token },
               finish_reason: null,
             },
           ],
         };
-        sentRole = true;
         controller.enqueue(encodeSSE({ data: JSON.stringify(chunk) }));
       };
 
       const ok = await tryStreamFromYou(prompt, cookie, tokenSender, model);
+      // Emit a final finish_reason chunk for compatibility
+      const finalChunk = {
+        id,
+        object: "chat.completion.chunk",
+        created,
+        model,
+        choices: [
+          { index: 0, delta: {}, finish_reason: "stop" },
+        ],
+      };
+      controller.enqueue(encodeSSE({ data: JSON.stringify(finalChunk) }));
+
       // End
       if (!ok && contentBuf.length === 0) {
         // Fallback single message when streaming failed early
@@ -246,7 +317,7 @@ async function handleChatCompletions(body, request, env) {
           created,
           model,
           choices: [
-            { index: 0, delta: { ...(sentRole ? {} : { role: "assistant" }), content: "" }, finish_reason: null },
+            { index: 0, delta: { content: "" }, finish_reason: null },
           ],
         };
         controller.enqueue(encodeSSE({ data: JSON.stringify(fallbackChunk) }));
@@ -273,6 +344,9 @@ async function handleChatCompletions(body, request, env) {
   if (!text) {
     text = await bufferSSEFromYou(prompt, cookie, model);
   }
+  if (!text) {
+    return withCors(json({ error: "upstream_empty", message: "No response from you.com. Provide valid YOU_COOKIE or try again." }, 502), request);
+  }
   const id = makeId();
   const created = Math.floor(Date.now() / 1000);
   const resp = {
@@ -283,7 +357,7 @@ async function handleChatCompletions(body, request, env) {
     choices: [
       {
         index: 0,
-        message: { role: "assistant", content: text || "" },
+        message: { role: "assistant", content: text },
         finish_reason: "stop",
       },
     ],
@@ -333,9 +407,12 @@ async function getModels(env, request) {
     try {
       const dynamic = await tryFetchModelsFromYou(env, request);
       if (dynamic && dynamic.length) {
-        cache.models = dynamic;
+        // merge with EXTRA_MODELS if present
+        const extra = await getExtraModels(env);
+        const merged = Array.from(new Set([...(dynamic || []), ...(extra || [])]));
+        cache.models = merged.length ? merged : dynamic;
         cache.ts = now;
-        return dynamic;
+        return cache.models;
       }
     } catch (e) {
       // swallow and fallback
@@ -347,18 +424,24 @@ async function getModels(env, request) {
     try {
       const parsed = JSON.parse(env.STATIC_MODELS);
       if (Array.isArray(parsed) && parsed.every((m) => typeof m === "string" && m.trim())) {
-        cache.models = parsed;
+        // also merge EXTRA_MODELS
+        const extra = await getExtraModels(env);
+        const merged = Array.from(new Set([...(parsed || []), ...(extra || [])]));
+        cache.models = merged.length ? merged : parsed;
         cache.ts = now;
-        return parsed;
+        return cache.models;
       }
     } catch (e) {
       // ignore and fallback to defaults
     }
   }
 
-  cache.models = DEFAULT_MODELS;
+  // default + extra
+  const extra = await getExtraModels(env);
+  const merged = Array.from(new Set([...(DEFAULT_MODELS || []), ...(extra || [])]));
+  cache.models = merged;
   cache.ts = now;
-  return DEFAULT_MODELS;
+  return merged;
 }
 
 async function tryFetchModelsFromYou(env, request) {
@@ -366,11 +449,19 @@ async function tryFetchModelsFromYou(env, request) {
   const password = env?.YOU_PASSWORD;
   const cookieCandidate = (await pickCookie(env, request, null)) || "";
 
+  const augmented = new Set();
+  const add = (arr) => {
+    if (!arr) return;
+    for (const m of arr) if (typeof m === "string" && m.trim()) augmented.add(m.trim());
+  };
+
   // If user provides cookie (via header/KV/env), attempt model endpoints with it
   const publicCandidates = [
     "https://you.com/api/models",
     "https://you.com/api/llm/models",
     "https://you.com/api/llm/providers",
+    "https://you.com/api/chat/models",
+    "https://you.com/api/ai/models",
   ];
   if (cookieCandidate) {
     for (const url of publicCandidates) {
@@ -379,10 +470,19 @@ async function tryFetchModelsFromYou(env, request) {
         if (r.ok) {
           const data = await safeJson(r);
           const models = normalizeModelsFromUnknown(data);
-          if (models?.length) return models;
+          add(models);
         }
       } catch (_) {}
     }
+    // Try to detect pro status and augment
+    const pro = await isProAccount(cookieCandidate);
+    if (pro) add(PRO_BONUS_MODELS);
+
+    // Merge any EXTRA_MODELS from env/KV
+    const extra = await getExtraModels(env);
+    add(extra);
+
+    if (augmented.size) return Array.from(augmented);
   }
 
   // Try unauthenticated endpoints first
@@ -392,10 +492,11 @@ async function tryFetchModelsFromYou(env, request) {
       if (r.ok) {
         const data = await safeJson(r);
         const models = normalizeModelsFromUnknown(data);
-        if (models?.length) return models;
+        add(models);
       }
     } catch (_) {}
   }
+  if (augmented.size) return Array.from(augmented);
 
   // If no username/password configured, stop here
   if (!username || !password) return null;
@@ -436,10 +537,11 @@ async function tryFetchModelsFromYou(env, request) {
       if (r.ok) {
         const data = await safeJson(r);
         const models = normalizeModelsFromUnknown(data);
-        if (models?.length) return models;
+        add(models);
       }
     } catch (_) {}
   }
+  if (augmented.size) return Array.from(augmented);
 
   return null;
 }
@@ -529,14 +631,31 @@ function normalizeModelsFromUnknown(data) {
       .filter((x) => typeof x === "string" && x.trim());
     if (ids.length) return ids;
   }
-  // 3) Object with models field
+  // 3) Object with models/provider fields
   if (typeof data === "object") {
-    const fromModels = data.models || data.data || data.available || data.list;
-    if (Array.isArray(fromModels)) {
-      const ids = fromModels
-        .map((x) => (typeof x === "string" ? x : x?.id || x?.model || x?.name))
-        .filter((x) => typeof x === "string" && x.trim());
-      if (ids.length) return ids;
+    // common containers
+    const candidates = [data.models, data.data, data.available, data.list, data.items, data.result];
+    for (const c of candidates) {
+      if (Array.isArray(c)) {
+        const ids = c
+          .map((x) => (typeof x === "string" ? x : x?.id || x?.model || x?.name))
+          .filter((x) => typeof x === "string" && x.trim());
+        if (ids.length) return ids;
+      }
+    }
+    // providers format: { providers: [{ id, models: [...] }]} or nested
+    if (Array.isArray(data.providers)) {
+      const out = [];
+      for (const p of data.providers) {
+        const list = p?.models || p?.availableModels || p?.data;
+        if (Array.isArray(list)) {
+          for (const m of list) {
+            const id = typeof m === "string" ? m : m?.id || m?.model || m?.name;
+            if (id) out.push(id);
+          }
+        }
+      }
+      if (out.length) return out;
     }
   }
   return null;
@@ -546,6 +665,7 @@ async function tryJsonFromYou(prompt, cookie, model) {
   const endpoints = [
     (q) => `https://you.com/api/youchat?query=${encodeURIComponent(q)}`,
     (q) => `https://you.com/api/chat?query=${encodeURIComponent(q)}`,
+    (q) => `https://you.com/api/answers?query=${encodeURIComponent(q)}`,
   ];
   for (const makeUrl of endpoints) {
     try {
@@ -556,7 +676,7 @@ async function tryJsonFromYou(prompt, cookie, model) {
       if (!r.ok) continue;
       const data = await safeJson(r);
       if (!data) continue;
-      const text = data.answer || data.response || data.message || data.output || data.text || "";
+      const text = data.answer || data.response || data.message || data.output || data.text || data?.data?.answer || "";
       if (typeof text === "string" && text.trim()) {
         return { text, raw: data };
       }
@@ -610,6 +730,7 @@ async function parseYouSSE(readable, onToken) {
   const reader = readable.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
+  let shouldBreak = false;
 
   while (true) {
     const { done, value } = await reader.read();
@@ -620,21 +741,38 @@ async function parseYouSSE(readable, onToken) {
     while ((idx = buffer.indexOf("\n\n")) !== -1) {
       const chunk = buffer.slice(0, idx);
       buffer = buffer.slice(idx + 2);
-      const line = chunk.trim();
-      if (!line) continue;
-      const m = line.match(/^data:\s*(.*)$/i);
-      if (!m) continue;
-      const payload = m[1];
-      if (payload === "[DONE]") break;
-      try {
-        const obj = JSON.parse(payload);
-        const token = obj?.youChatToken || obj?.token || obj?.text || obj?.message || obj?.delta || "";
-        if (token) await onToken(String(token));
-      } catch (_) {
-        // Sometimes streamingSearch sends plain tokens
-        if (payload) await onToken(String(payload));
+
+      const lines = chunk.split("\n");
+      for (const lineRaw of lines) {
+        const line = lineRaw.trim();
+        if (!line) continue;
+        if (line.startsWith(":")) continue; // comment line
+        const m = line.match(/^data:\s*(.*)$/i);
+        if (!m) continue;
+        const payload = m[1];
+        if (payload === "[DONE]") { shouldBreak = true; break; }
+        try {
+          const obj = JSON.parse(payload);
+          const token =
+            obj?.youChatToken ||
+            obj?.token ||
+            obj?.text ||
+            obj?.message ||
+            obj?.delta ||
+            obj?.v ||
+            obj?.value ||
+            obj?.completion ||
+            (obj?.youChatSerpResult && (obj.youChatSerpResult.text || obj.youChatSerpResult.answer)) ||
+            "";
+          if (token) await onToken(String(token));
+        } catch (_) {
+          // Sometimes streamingSearch sends plain tokens
+          if (payload) await onToken(String(payload));
+        }
       }
+      if (shouldBreak) break;
     }
+    if (shouldBreak) break;
   }
 }
 
@@ -655,6 +793,7 @@ function makeSSEStream() {
 }
 
 function encodeSSE({ data }) {
+  // Ensure each event is separated and small; avoid buffering by proxies
   return new TextEncoder().encode(`data: ${data}\n\n`);
 }
 
@@ -705,6 +844,8 @@ function defaultHeaders() {
     "user-agent":
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
     accept: "application/json, text/plain, */*",
+    referer: "https://you.com/",
+    origin: "https://you.com",
   };
 }
 
@@ -741,7 +882,49 @@ function withCors(response, request) {
     "authorization, content-type, x-api-key, x-requested-with, x-you-cookie, x-you-cookie-b64, x-you-cookie-base64"
   );
   headers.set("access-control-allow-methods", "GET, POST, DELETE, OPTIONS");
+  headers.set("cache-control", "no-store");
   return new Response(response.body, { status: response.status, headers });
+}
+
+async function isProAccount(cookie) {
+  const endpoints = [
+    "https://you.com/api/subscription",
+    "https://you.com/api/entitlements",
+    "https://you.com/api/user",
+  ];
+  for (const url of endpoints) {
+    try {
+      const r = await fetch(url, { headers: { ...defaultHeaders(), cookie } });
+      if (!r.ok) continue;
+      const data = await safeJson(r);
+      if (!data) continue;
+      if (typeof data === "object") {
+        if (data.plan === "pro" || data.tier === "pro" || data.isPro === true || data.youPro === true) return true;
+        if (Array.isArray(data.entitlements)) {
+          if (data.entitlements.some((e) => /pro|plus|premium/i.test(e?.name || e?.id || ""))) return true;
+        }
+      }
+    } catch (_) {}
+  }
+  return false;
+}
+
+async function getExtraModels(env) {
+  const out = new Set();
+  try {
+    const fromEnv = env?.EXTRA_MODELS ? JSON.parse(env.EXTRA_MODELS) : [];
+    if (Array.isArray(fromEnv)) for (const m of fromEnv) if (typeof m === "string" && m.trim()) out.add(m.trim());
+  } catch (_) {}
+  if (env?.YOU_COOKIE_KV && typeof env.YOU_COOKIE_KV.get === "function") {
+    try {
+      const raw = await env.YOU_COOKIE_KV.get(KV_EXTRA_MODELS_KEY);
+      if (raw) {
+        const arr = JSON.parse(raw);
+        if (Array.isArray(arr)) for (const m of arr) if (typeof m === "string" && m.trim()) out.add(m.trim());
+      }
+    } catch (_) {}
+  }
+  return Array.from(out);
 }
 
 function makeId() {

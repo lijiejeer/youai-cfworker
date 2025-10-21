@@ -22,8 +22,9 @@
    - DYNAMIC_FETCH：可选。设为 `true` 时，`/v1/models` 会尝试从 you.com 动态探测模型
    - STATIC_MODELS：可选。JSON 数组字符串，覆盖默认模型列表，例如：
      - `["gpt-4o","claude-3-5-sonnet","llama-3.1-70b-instruct"]`
+   - EXTRA_MODELS：可选。JSON 数组字符串，作为附加模型与动态/静态列表合并
    - CACHE_TTL_SECONDS：可选。模型列表缓存时间（默认 900 秒）
-4. 保存并部署 Worker
+   4. 保存并部署 Worker
 
 ## 鉴权对应值的获取方式
 
@@ -71,6 +72,7 @@
 
 - 获取模型列表（OpenAI 兼容）：
   - `GET /v1/models`
+  - 当提供了有效的 you.com Cookie 时，会尽力探测你的账户可用模型；若检测到 Pro/Plus 账户，将自动合并一组常见 Pro 模型；还会合并你通过 `EXTRA_MODELS` 环境变量或 `/admin/models` 设置的自定义模型列表。
 
 - 对话补全（OpenAI Chat Completions 兼容）：
   - `POST /v1/chat/completions`
@@ -119,17 +121,25 @@ curl -s https://<你的-worker-子域>.workers.dev/v1/completions \
   }'
 ```
 
-### 管理接口（用于在 KV 中设置 Cookie）
+### 管理接口（用于在 KV 中设置 Cookie 和自定义模型）
 
 - 说明：需先在 Cloudflare 控制台为 Worker 绑定一个 KV 命名空间，变量名为 `YOU_COOKIE_KV`。
 - 统一鉴权：所有 /admin 路由都需要 `MANUAL_API_KEY`。
-- 接口：
+- Cookie 接口：
   - `POST /admin/cookie` 设置 Cookie
     - 请求体（JSON）：`{"cookie":"<完整Cookie>"}` 或 `{"cookie_b64":"<Base64>"}`
     - 响应：`{"ok":true}`
   - `GET /admin/cookie` 查看是否已设置
     - 响应：`{"exists":true, "length": 6900}`（不会返回具体 Cookie）
   - `DELETE /admin/cookie` 清除 Cookie
+    - 响应：`{"ok":true}`
+- 自定义模型接口：
+  - `POST /admin/models` 设置附加模型列表
+    - 请求体（JSON）：`{"models": ["model-a","model-b",...]}` 或 `{"models": "[\"model-a\",\"model-b\"]"}`
+    - 响应：`{"ok":true, "count":2}`
+  - `GET /admin/models` 获取已设置的附加模型列表
+    - 响应：`{"data":["model-a","model-b"]}`
+  - `DELETE /admin/models` 清空附加模型列表
     - 响应：`{"ok":true}`
 
 ## Cherry Studio 客户端配置
