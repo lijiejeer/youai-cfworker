@@ -1,0 +1,15 @@
+# Node / general
+node_modules/
+.DS_Store
+.env
+.env.*
+*.local
+
+# Cloudflare Workers
+.wrangler/
+wrangler.toml
+
+# Build artifacts
+.dist/
+dist/
+.cache/
